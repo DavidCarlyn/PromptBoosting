@@ -8,7 +8,8 @@ import os
 from sklearn.gaussian_process import GaussianProcessClassifier
 from sklearn.gaussian_process.kernels import RBF
 from sklearn.svm import SVC
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.model_selection import GridSearchCV, ParameterGrid
 
 from src.multicls_trainer import PromptBoostingMLTrainer
 from src.ptuning import BaseModel, RoBERTaVTuningClassification, OPTVTuningClassification
@@ -49,6 +50,8 @@ parser.add_argument("--fewshot_k", type = int, default = 0)
 parser.add_argument("--fewshot_seed", type = int, default = 100, choices = [100, 13, 21, 42, 87])
 
 parser.add_argument("--filter_templates", action = 'store_true')
+parser.add_argument("--classifier", type=str, default="svm")
+parser.add_argument("--use_logits_final", action="store_true", default=False)
 
 args = parser.parse_args()
 
@@ -128,7 +131,7 @@ if __name__ == '__main__':
     dir_list = "\n\t".join(template_manager.template_dir_list)
     print(f"using templates from: {dir_list}",)
 
-    trainer = PromptBoostingMLTrainer(adaboost_lr = adaboost_lr, num_classes = num_classes, adaboost_maximum_epoch = adaboost_maximum_epoch, use_logits=True)
+    trainer = PromptBoostingMLTrainer(adaboost_lr = adaboost_lr, num_classes = num_classes, adaboost_maximum_epoch = adaboost_maximum_epoch, use_logits=args.use_logits_final)
 
     if pred_cache_dir != '':
         prediction_saver = PredictionSaver(save_dir = os.path.join(ROOT_DIR, pred_cache_dir), model_name = model,
@@ -144,7 +147,12 @@ if __name__ == '__main__':
 
     word2idx = vtuning_model.tokenizer.get_vocab()
 
+    def to_numpy(x):
+        if isinstance(x, np.ndarray): return x
+        return x.detach().cpu().numpy()
+
     # Obtain features/probs
+    print("Collecting features")
     all_train_probs = None
     all_valid_probs = None
     all_test_probs = None
@@ -153,60 +161,100 @@ if __name__ == '__main__':
         template.visualize()
         cached_preds, flag = prediction_saver.load_preds(template)
         if not flag:
-            train_probs = trainer.pre_compute_logits(vtuning_model, template, train_dataset,)
-            valid_probs = trainer.pre_compute_logits(vtuning_model, template, valid_dataset,)
+            train_probs = to_numpy(trainer.pre_compute_logits(vtuning_model, template, train_dataset,))
+            valid_probs = to_numpy(trainer.pre_compute_logits(vtuning_model, template, valid_dataset,))
             prediction_saver.save_preds(template, train_probs, valid_probs)
         else:
             train_probs, valid_probs = cached_preds
+            train_probs = to_numpy(train_probs)
+            valid_probs = to_numpy(valid_probs)
         
-        test_probs = trainer.pre_compute_logits(vtuning_model, template, test_dataset)
+        test_probs = to_numpy(trainer.pre_compute_logits(vtuning_model, template, test_dataset))
 
         if all_train_probs is None:
             all_train_probs = train_probs
             all_valid_probs = valid_probs
             all_test_probs = test_probs
         else:
-            all_train_probs = torch.cat((all_train_probs, train_probs), dim=1)
-            all_valid_probs = torch.cat((all_valid_probs, valid_probs), dim=1)
-            all_test_probs = torch.cat((all_test_probs, test_probs), dim=1)
+            all_train_probs = np.concatenate((all_train_probs, train_probs), axis=1)
+            all_valid_probs = np.concatenate((all_valid_probs, valid_probs), axis=1)
+            all_test_probs = np.concatenate((all_test_probs, test_probs), axis=1)
 
 
     # Data
-    train_features = all_train_probs.detach().cpu().numpy()
-    train_labels = train_labels.detach().cpu().numpy()
-    valid_features = all_valid_probs.detach().cpu().numpy()
-    valid_labels = valid_labels.detach().cpu().numpy()
-    test_features = all_test_probs.detach().cpu().numpy()
-    test_labels = test_labels.detach().cpu().numpy()
+    train_features = all_train_probs
+    train_labels = to_numpy(train_labels)
+    valid_features = all_valid_probs
+    valid_labels = to_numpy(valid_labels)
+    test_features = all_test_probs
+    test_labels = to_numpy(test_labels)
 
-    # SVM
-    svc = SVC(gamma='auto')
-    svc.fit(train_features, train_labels)
+    estimator = None
+    params = {
 
-    train_acc = svc.score(train_features, train_labels)
-    valid_acc = svc.score(valid_features, valid_labels)
-    test_acc = svc.score(test_features, test_labels)
+    }
+    if args.classifier == "svm":
+        estimator = SVC()
+        params = {
+            "kernel" : ["rbf"],
+            "gamma" : np.arange(0.1, 4.1, 0.1)
+        }
+    elif args.classifier == "xgboost":
+        estimator = GradientBoostingClassifier(random_state=0)
+        params = {
+            "n_estimators" : [10, 25, 50, 100],
+            "learning_rate" : [0.1, 1.0, 2.0],
+            "criterion" : ["friedman_mse", "squared_error"],
+            "max_depth" : [1, 2, 3],
+            "max_features" : ["sqrt", "log2"]
+        }
+    elif args.classifier == "random-forest":
+        estimator = RandomForestClassifier(random_state=0)
+        params = {
+            "n_estimators" : [10, 25, 50, 100],
+            "criterion" : ["gini", "entropy", "log_loss"],
+            "max_depth" : [1, 2, 3],
+            "max_features" : ["sqrt", "log2"],
+            "bootstrap" : [True, False]
+        }
 
-    print(f"SVM | Train: {round(train_acc, 4)*100}% - Val: {round(valid_acc, 4)*100}% - Test: {round(test_acc, 4)*100}%")
-        
-    # RBF
-    kernel = 1.0 * RBF(1.0)
-    gpc = GaussianProcessClassifier(kernel=kernel, random_state=0).fit(train_features, train_labels)
-    
-    train_acc = gpc.score(train_features, train_labels)
-    valid_acc = gpc.score(valid_features, valid_labels)
-    test_acc = gpc.score(test_features, test_labels)
-    
-    print(f"RBF | Train: {round(train_acc, 4)*100}% - Val: {round(valid_acc, 4)*100}% - Test: {round(test_acc, 4)*100}%")
-    
-    # XGBoost
-    xg = GradientBoostingClassifier(n_estimators=100, learning_rate=1.0, max_depth=1, random_state=0).fit(train_features, train_labels)
-    
-    train_acc = xg.score(train_features, train_labels)
-    valid_acc = xg.score(valid_features, valid_labels)
-    test_acc = xg.score(test_features, test_labels)
-    
-    print(f"XG | Train: {round(train_acc, 4)*100}% - Val: {round(valid_acc, 4)*100}% - Test: {round(test_acc, 4)*100}%")
+    best_params = {}
+    best_score = 0
+    grid = ParameterGrid(params)
+    for i, cur_params in enumerate(grid):
+        print(f"Fit {i+1}/{len(grid)}") 
+        print(cur_params)
+        estimator.set_params(**cur_params)
+        estimator.fit(train_features, train_labels)
+        train_acc = estimator.score(train_features, train_labels)
+        valid_acc = estimator.score(valid_features, valid_labels)
+        test_acc = estimator.score(test_features, test_labels)
 
-    
+        print(cur_params)
+        print(f"{args.classifier} | Train: {round(train_acc, 4)*100}% - Val: {round(valid_acc, 4)*100}% - Test: {round(test_acc, 4)*100}%")
+        if valid_acc > best_score:
+            best_score = valid_acc
+            best_params = cur_params
+
+    """
+    classifier = GridSearchCV(
+        estimator=estimator,
+        param_grid=params,
+        cv=5,
+        n_jobs=5,
+        verbose=3
+    )
+    """
+
+    print("Best results")
+
+    estimator.set_params(**best_params)
+    estimator.fit(train_features, train_labels)
+    train_acc = estimator.score(train_features, train_labels)
+    valid_acc = estimator.score(valid_features, valid_labels)
+    test_acc = estimator.score(test_features, test_labels)
+
+    print(best_params)
+    print(f"{args.classifier} | Train: {round(train_acc, 4)*100}% - Val: {round(valid_acc, 4)*100}% - Test: {round(test_acc, 4)*100}%")
+
      
